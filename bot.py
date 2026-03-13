@@ -48,6 +48,22 @@ INQUIRY_PANEL_CHANNEL_ID = 1481598213281677424  # 意見單頻道（面板所在
 PRODUCTS_FILE = "products.json"
 PRODUCTS = []
 
+# ============================================================
+# 動態管理員列表 - 從 managers.json 載入
+# { "guild_id": [user_id, user_id, ...] }
+# ============================================================
+MANAGERS_FILE = "managers.json"
+GUILD_MANAGERS = {}
+
+# ============================================================
+# 伺服器配置 - 從 guild_config.json 載入
+# { "guild_id": { "product_log_channel": id, "inquiry_log_channel": id,
+#                  "product_category": id, "inquiry_category": id } }
+# ============================================================
+GUILD_CONFIG_FILE = "guild_config.json"
+GUILD_CONFIG = {}
+
+
 def load_products():
     """從 products.json 載入商品列表"""
     global PRODUCTS
@@ -62,6 +78,7 @@ def load_products():
         print(f"⚠️ 載入商品資料失敗: {e}")
         PRODUCTS = []
 
+
 def save_products():
     """保存商品列表到 products.json"""
     try:
@@ -69,6 +86,71 @@ def save_products():
             json.dump(PRODUCTS, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"⚠️ 保存商品資料失敗: {e}")
+
+
+def load_managers():
+    """從 managers.json 載入動態管理員列表"""
+    global GUILD_MANAGERS
+    try:
+        if os.path.exists(MANAGERS_FILE):
+            with open(MANAGERS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                # 確保 key 為 str，value 為 list[int]
+                GUILD_MANAGERS = {str(k): [int(uid) for uid in v] for k, v in raw.items()}
+                total = sum(len(v) for v in GUILD_MANAGERS.values())
+                print(f"👥 已載入 {total} 個動態管理員（跨 {len(GUILD_MANAGERS)} 個伺服器）")
+        else:
+            GUILD_MANAGERS = {}
+    except Exception as e:
+        print(f"⚠️ 載入管理員資料失敗: {e}")
+        GUILD_MANAGERS = {}
+
+
+def save_managers():
+    """保存動態管理員列表到 managers.json"""
+    try:
+        with open(MANAGERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(GUILD_MANAGERS, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ 保存管理員資料失敗: {e}")
+
+
+def load_guild_config():
+    """從 guild_config.json 載入伺服器配置"""
+    global GUILD_CONFIG
+    try:
+        if os.path.exists(GUILD_CONFIG_FILE):
+            with open(GUILD_CONFIG_FILE, "r", encoding="utf-8") as f:
+                GUILD_CONFIG = json.load(f)
+                print(f"⚙️ 已載入 {len(GUILD_CONFIG)} 個伺服器配置")
+        else:
+            GUILD_CONFIG = {}
+    except Exception as e:
+        print(f"⚠️ 載入伺服器配置失敗: {e}")
+        GUILD_CONFIG = {}
+
+
+def save_guild_config():
+    """保存伺服器配置到 guild_config.json"""
+    try:
+        with open(GUILD_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(GUILD_CONFIG, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ 保存伺服器配置失敗: {e}")
+
+
+def get_guild_config(guild_id: int) -> dict:
+    """取得伺服器配置，不存在則建立預設"""
+    gid = str(guild_id)
+    if gid not in GUILD_CONFIG:
+        GUILD_CONFIG[gid] = {
+            "product_log_channel": None,
+            "inquiry_log_channel": None,
+            "product_category": PRODUCT_CATEGORY_ID,
+            "inquiry_category": INQUIRY_CATEGORY_ID,
+        }
+    return GUILD_CONFIG[gid]
+
 
 # ============================================================
 # 內存存儲
@@ -97,13 +179,27 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 def has_role(member: discord.Member, role_id: int) -> bool:
     return any(role.id == role_id for role in member.roles)
 
+
 def is_admin(member: discord.Member) -> bool:
-    """檢查是否為管理員（管理員身分組 或 代理身分組）"""
-    return has_role(member, ADMIN_ROLE_ID) or has_role(member, AGENT_ROLE_ID)
+    """檢查是否為管理員（管理員身分組 或 代理身分組 或 動態管理員 或 超級管理員）"""
+    # 超級管理員一定是管理員
+    if is_super_admin(member.id):
+        return True
+    # 固定身分組
+    if has_role(member, ADMIN_ROLE_ID) or has_role(member, AGENT_ROLE_ID):
+        return True
+    # 動態管理員（按伺服器）
+    if member.guild:
+        gid = str(member.guild.id)
+        if gid in GUILD_MANAGERS and member.id in GUILD_MANAGERS[gid]:
+            return True
+    return False
+
 
 def is_super_admin(user_id: int) -> bool:
     """檢查是否為超級管理員（默認管理員）"""
     return user_id in SUPER_ADMIN_IDS
+
 
 def get_ticket_data(channel_id: int) -> dict:
     if channel_id not in ticket_data:
@@ -128,8 +224,10 @@ def get_ticket_data(channel_id: int) -> dict:
 async def save_transcript(channel: discord.TextChannel, ticket_owner: discord.Member,
                           ticket_type: str, ticket_info: str,
                           price: str = None, claimed_by_name: str = None,
-                          closer: discord.Member = None):
-    """保存聊天記錄 - 簡潔 Embed + txt 附件格式，發送到同一頻道作為記錄"""
+                          closer: discord.Member = None,
+                          log_channel: discord.TextChannel = None):
+    """保存聊天記錄 - 簡潔 Embed + txt 附件格式
+    如果有指定 log_channel，則同時發送到結單記錄頻道"""
     messages = []
     async for msg in channel.history(limit=500, oldest_first=True):
         messages.append(msg)
@@ -156,13 +254,6 @@ async def save_transcript(channel: discord.TextChannel, ticket_owner: discord.Me
         chat_lines.append(f"[{timestamp}] {msg.author}: {content}")
 
     chat_text = "\n".join(chat_lines)
-
-    # 建立 txt 附件
-    file_bytes = chat_text.encode("utf-8")
-    txt_file = discord.File(
-        io.BytesIO(file_bytes),
-        filename=f"{channel.name}-log.txt"
-    )
 
     # 建立簡潔的 Embed
     open_time = messages[0].created_at.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -211,7 +302,26 @@ async def save_transcript(channel: discord.TextChannel, ticket_owner: discord.Me
             inline=False
         )
 
+    # 發送到工單頻道本身
+    file_bytes = chat_text.encode("utf-8")
+    txt_file = discord.File(
+        io.BytesIO(file_bytes),
+        filename=f"{channel.name}-log.txt"
+    )
     await channel.send(embed=transcript_embed, file=txt_file)
+
+    # 如果有指定結單記錄頻道，也發送一份到那裡
+    if log_channel:
+        try:
+            file_bytes2 = chat_text.encode("utf-8")
+            txt_file2 = discord.File(
+                io.BytesIO(file_bytes2),
+                filename=f"{channel.name}-log.txt"
+            )
+            await log_channel.send(embed=transcript_embed, file=txt_file2)
+        except Exception as e:
+            print(f"⚠️ 發送結單記錄到 {log_channel.id} 失敗: {e}")
+
     return chat_text
 
 
@@ -314,14 +424,15 @@ class AddInquiryItemModal(discord.ui.Modal, title="🛒 新增購買物品 | Add
             for i, it in enumerate(data["inquiry_items"], 1):
                 items_text += f"{i}. {it['name']} - {it['price']}\n"
             item_embed.add_field(name="📦 所有購買物品", value=items_text, inline=False)
-            if total > 0:
-                item_embed.add_field(name="💰 合計金額", value=f"**{total:.0f} tokens**", inline=False)
+
+        if data.get("price"):
+            item_embed.add_field(name="💰 目前總金額", value=data["price"], inline=False)
 
         await interaction.response.send_message(embed=item_embed)
 
 
 # ============================================================
-# 管理員操作面板（設定金額按鈕）
+# 管理員面板按鈕 View
 # ============================================================
 
 class AdminTicketView(discord.ui.View):
@@ -512,10 +623,23 @@ class ConfirmCloseView(discord.ui.View):
             except (ValueError, IndexError):
                 pass
 
+        # 確定結單記錄頻道
+        log_channel = None
+        log_ch_id = data.get("log_channel_id")
+        if log_ch_id:
+            log_channel = guild.get_channel(log_ch_id)
+        else:
+            # 從伺服器配置中取得
+            gconfig = get_guild_config(guild.id)
+            if is_inquiry and gconfig.get("inquiry_log_channel"):
+                log_channel = guild.get_channel(gconfig["inquiry_log_channel"])
+            elif not is_inquiry and gconfig.get("product_log_channel"):
+                log_channel = guild.get_channel(gconfig["product_log_channel"])
+
         # 保存聊天記錄
         await save_transcript(channel, ticket_owner, ticket_type, ticket_info,
                               price=price, claimed_by_name=claimed_by_name,
-                              closer=interaction.user)
+                              closer=interaction.user, log_channel=log_channel)
 
         # 清理內存
         if channel.id in ticket_data:
@@ -645,7 +769,10 @@ class ProductSelectMenu(discord.ui.Select):
             return
 
         guild = interaction.guild
-        category = guild.get_channel(PRODUCT_CATEGORY_ID)
+        # 取得該伺服器的商品開單類別
+        gconfig = get_guild_config(guild.id)
+        cat_id = gconfig.get("product_category", PRODUCT_CATEGORY_ID)
+        category = guild.get_channel(cat_id)
 
         if not category:
             await interaction.response.send_message("❌ 找不到開單類別，請聯繫管理員。", ephemeral=True)
@@ -689,6 +816,17 @@ class ProductSelectMenu(discord.ui.Select):
                 attach_files=True, embed_links=True
             )
 
+        # 為動態管理員添加權限
+        gid = str(guild.id)
+        if gid in GUILD_MANAGERS:
+            for mgr_id in GUILD_MANAGERS[gid]:
+                mgr = guild.get_member(mgr_id)
+                if mgr:
+                    overwrites[mgr] = discord.PermissionOverwrite(
+                        read_messages=True, send_messages=True,
+                        attach_files=True, embed_links=True
+                    )
+
         ticket_channel = await guild.create_text_channel(
             name=f"order-{interaction.user.name.lower().replace(' ', '-')}",
             category=category,
@@ -701,6 +839,9 @@ class ProductSelectMenu(discord.ui.Select):
         data["ticket_info"] = f"商品: {product['name']} | 價格: {product['description']}"
         data["owner_id"] = interaction.user.id
         data["is_inquiry"] = False
+        # 設定結單記錄頻道
+        if gconfig.get("product_log_channel"):
+            data["log_channel_id"] = gconfig["product_log_channel"]
 
         price_text = "\n".join([f"• **{period}**: {price}" for period, price in product["prices"].items()])
 
@@ -765,7 +906,10 @@ class InquiryTicketView(discord.ui.View):
     )
     async def inquiry_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
-        category = guild.get_channel(INQUIRY_CATEGORY_ID)
+        # 取得該伺服器的意見單類別
+        gconfig = get_guild_config(guild.id)
+        cat_id = gconfig.get("inquiry_category", INQUIRY_CATEGORY_ID)
+        category = guild.get_channel(cat_id)
 
         if not category:
             await interaction.response.send_message("❌ 找不到意見單類別，請聯繫管理員。", ephemeral=True)
@@ -810,6 +954,17 @@ class InquiryTicketView(discord.ui.View):
                 attach_files=True, embed_links=True
             )
 
+        # 為動態管理員添加權限
+        gid = str(guild.id)
+        if gid in GUILD_MANAGERS:
+            for mgr_id in GUILD_MANAGERS[gid]:
+                mgr = guild.get_member(mgr_id)
+                if mgr:
+                    overwrites[mgr] = discord.PermissionOverwrite(
+                        read_messages=True, send_messages=True,
+                        attach_files=True, embed_links=True
+                    )
+
         ticket_channel = await guild.create_text_channel(
             name=f"inquiry-{interaction.user.name.lower().replace(' ', '-')}",
             category=category,
@@ -822,6 +977,9 @@ class InquiryTicketView(discord.ui.View):
         data["ticket_info"] = "意見單開單"
         data["owner_id"] = interaction.user.id
         data["is_inquiry"] = True
+        # 設定結單記錄頻道
+        if gconfig.get("inquiry_log_channel"):
+            data["log_channel_id"] = gconfig["inquiry_log_channel"]
 
         ticket_embed = discord.Embed(
             title="📩 意見單 | Inquiry Ticket",
@@ -863,6 +1021,8 @@ async def on_ready():
 
     # 載入資料
     load_products()
+    load_managers()
+    load_guild_config()
 
     # 註冊持久化 View
     bot.add_view(ProductSelectView())
@@ -931,6 +1091,10 @@ async def on_interaction(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def setup_product(interaction: discord.Interaction):
     """設置商品購買開單面板（限定在購買開單頻道使用）"""
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ 僅管理員可使用此命令。", ephemeral=True)
+        return
+
     if interaction.channel_id != PRODUCT_PANEL_CHANNEL_ID:
         await interaction.response.send_message(
             f"❌ 請在 <#{PRODUCT_PANEL_CHANNEL_ID}> 頻道使用此命令。",
@@ -964,6 +1128,10 @@ async def setup_product(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def setup_inquiry(interaction: discord.Interaction):
     """設置意見單/洽群開單面板（限定在意見單頻道使用）"""
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ 僅管理員可使用此命令。", ephemeral=True)
+        return
+
     if interaction.channel_id != INQUIRY_PANEL_CHANNEL_ID:
         await interaction.response.send_message(
             f"❌ 請在 <#{INQUIRY_PANEL_CHANNEL_ID}> 頻道使用此命令。",
@@ -990,16 +1158,18 @@ async def setup_inquiry(interaction: discord.Interaction):
 
 
 # ============================================================
-# 超級管理員特殊指令：可自訂類別和頻道建立面板
+# 超級管理員特殊指令：可自訂類別、頻道、結單頻道建立面板
 # ============================================================
 
 @bot.tree.command(name="admin-setup-product", description="[超級管理員] 在指定類別和頻道建立商品面板")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     category_id="開單類別 ID",
-    channel_id="面板發送的頻道 ID"
+    channel_id="面板發送的頻道 ID",
+    log_channel_id="結單記錄頻道 ID（結單時聊天記錄會發送到此頻道）"
 )
-async def admin_setup_product(interaction: discord.Interaction, category_id: str, channel_id: str):
-    """超級管理員專用：可在任何頻道建立商品購買面板，並自訂開單類別"""
+async def admin_setup_product(interaction: discord.Interaction, category_id: str, channel_id: str, log_channel_id: str):
+    """超級管理員專用：可在任何頻道建立商品購買面板，並自訂開單類別和結單頻道"""
     if not is_super_admin(interaction.user.id):
         await interaction.response.send_message("❌ 僅超級管理員可使用此命令。", ephemeral=True)
         return
@@ -1007,6 +1177,7 @@ async def admin_setup_product(interaction: discord.Interaction, category_id: str
     try:
         cat_id = int(category_id)
         ch_id = int(channel_id)
+        log_ch_id = int(log_channel_id)
     except ValueError:
         await interaction.response.send_message("❌ 請輸入有效的 ID（純數字）。", ephemeral=True)
         return
@@ -1014,6 +1185,7 @@ async def admin_setup_product(interaction: discord.Interaction, category_id: str
     guild = interaction.guild
     target_channel = guild.get_channel(ch_id)
     target_category = guild.get_channel(cat_id)
+    target_log_channel = guild.get_channel(log_ch_id)
 
     if not target_channel:
         await interaction.response.send_message(f"❌ 找不到頻道 ID: {ch_id}", ephemeral=True)
@@ -1021,13 +1193,20 @@ async def admin_setup_product(interaction: discord.Interaction, category_id: str
     if not target_category:
         await interaction.response.send_message(f"❌ 找不到類別 ID: {cat_id}", ephemeral=True)
         return
+    if not target_log_channel:
+        await interaction.response.send_message(f"❌ 找不到結單頻道 ID: {log_ch_id}", ephemeral=True)
+        return
 
     await interaction.response.defer(ephemeral=True)
 
-    # 臨時覆寫全域變數
+    # 更新伺服器配置
+    gconfig = get_guild_config(guild.id)
+    gconfig["product_category"] = cat_id
+    gconfig["product_log_channel"] = log_ch_id
+    save_guild_config()
+
+    # 同時更新全域變數（向後兼容）
     global PRODUCT_CATEGORY_ID, PRODUCT_PANEL_CHANNEL_ID
-    old_cat = PRODUCT_CATEGORY_ID
-    old_ch = PRODUCT_PANEL_CHANNEL_ID
     PRODUCT_CATEGORY_ID = cat_id
     PRODUCT_PANEL_CHANNEL_ID = ch_id
 
@@ -1052,18 +1231,21 @@ async def admin_setup_product(interaction: discord.Interaction, category_id: str
     await interaction.followup.send(
         f"✅ 商品面板已建立！\n"
         f"• 面板頻道: <#{ch_id}>\n"
-        f"• 開單類別: {target_category.name} (`{cat_id}`)",
+        f"• 開單類別: {target_category.name} (`{cat_id}`)\n"
+        f"• 結單記錄頻道: <#{log_ch_id}>",
         ephemeral=True
     )
 
 
 @bot.tree.command(name="admin-setup-inquiry", description="[超級管理員] 在指定類別和頻道建立意見單面板")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     category_id="意見單類別 ID",
-    channel_id="面板發送的頻道 ID"
+    channel_id="面板發送的頻道 ID",
+    log_channel_id="結單記錄頻道 ID（結單時聊天記錄會發送到此頻道）"
 )
-async def admin_setup_inquiry(interaction: discord.Interaction, category_id: str, channel_id: str):
-    """超級管理員專用：可在任何頻道建立意見單面板，並自訂開單類別"""
+async def admin_setup_inquiry(interaction: discord.Interaction, category_id: str, channel_id: str, log_channel_id: str):
+    """超級管理員專用：可在任何頻道建立意見單面板，並自訂開單類別和結單頻道"""
     if not is_super_admin(interaction.user.id):
         await interaction.response.send_message("❌ 僅超級管理員可使用此命令。", ephemeral=True)
         return
@@ -1071,6 +1253,7 @@ async def admin_setup_inquiry(interaction: discord.Interaction, category_id: str
     try:
         cat_id = int(category_id)
         ch_id = int(channel_id)
+        log_ch_id = int(log_channel_id)
     except ValueError:
         await interaction.response.send_message("❌ 請輸入有效的 ID（純數字）。", ephemeral=True)
         return
@@ -1078,6 +1261,7 @@ async def admin_setup_inquiry(interaction: discord.Interaction, category_id: str
     guild = interaction.guild
     target_channel = guild.get_channel(ch_id)
     target_category = guild.get_channel(cat_id)
+    target_log_channel = guild.get_channel(log_ch_id)
 
     if not target_channel:
         await interaction.response.send_message(f"❌ 找不到頻道 ID: {ch_id}", ephemeral=True)
@@ -1085,13 +1269,20 @@ async def admin_setup_inquiry(interaction: discord.Interaction, category_id: str
     if not target_category:
         await interaction.response.send_message(f"❌ 找不到類別 ID: {cat_id}", ephemeral=True)
         return
+    if not target_log_channel:
+        await interaction.response.send_message(f"❌ 找不到結單頻道 ID: {log_ch_id}", ephemeral=True)
+        return
 
     await interaction.response.defer(ephemeral=True)
 
-    # 臨時覆寫全域變數
+    # 更新伺服器配置
+    gconfig = get_guild_config(guild.id)
+    gconfig["inquiry_category"] = cat_id
+    gconfig["inquiry_log_channel"] = log_ch_id
+    save_guild_config()
+
+    # 同時更新全域變數（向後兼容）
     global INQUIRY_CATEGORY_ID, INQUIRY_PANEL_CHANNEL_ID
-    old_cat = INQUIRY_CATEGORY_ID
-    old_ch = INQUIRY_PANEL_CHANNEL_ID
     INQUIRY_CATEGORY_ID = cat_id
     INQUIRY_PANEL_CHANNEL_ID = ch_id
 
@@ -1112,9 +1303,179 @@ async def admin_setup_inquiry(interaction: discord.Interaction, category_id: str
     await interaction.followup.send(
         f"✅ 意見單面板已建立！\n"
         f"• 面板頻道: <#{ch_id}>\n"
-        f"• 開單類別: {target_category.name} (`{cat_id}`)",
+        f"• 開單類別: {target_category.name} (`{cat_id}`)\n"
+        f"• 結單記錄頻道: <#{log_ch_id}>",
         ephemeral=True
     )
+
+
+# ============================================================
+# 超級管理員：動態管理員管理指令
+# ============================================================
+
+@bot.tree.command(name="admin-add-manager", description="[超級管理員] 添加管理員到此伺服器")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    user_id="要添加為管理員的用戶 ID"
+)
+async def admin_add_manager(interaction: discord.Interaction, user_id: str):
+    """超級管理員專用：在當前伺服器添加動態管理員"""
+    if not is_super_admin(interaction.user.id):
+        await interaction.response.send_message("❌ 僅超級管理員可使用此命令。", ephemeral=True)
+        return
+
+    try:
+        uid = int(user_id)
+    except ValueError:
+        await interaction.response.send_message("❌ 請輸入有效的用戶 ID（純數字）。", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    gid = str(guild.id)
+
+    # 檢查用戶是否存在於伺服器
+    member = guild.get_member(uid)
+    if not member:
+        # 嘗試 fetch
+        try:
+            member = await guild.fetch_member(uid)
+        except discord.NotFound:
+            await interaction.response.send_message(f"❌ 在此伺服器中找不到用戶 ID: {uid}", ephemeral=True)
+            return
+        except discord.HTTPException:
+            await interaction.response.send_message(f"❌ 無法查詢用戶 ID: {uid}", ephemeral=True)
+            return
+
+    # 檢查是否已經是管理員
+    if gid in GUILD_MANAGERS and uid in GUILD_MANAGERS[gid]:
+        await interaction.response.send_message(
+            f"❌ **{member.display_name}** (`{uid}`) 已經是此伺服器的管理員了。",
+            ephemeral=True
+        )
+        return
+
+    # 添加管理員
+    if gid not in GUILD_MANAGERS:
+        GUILD_MANAGERS[gid] = []
+    GUILD_MANAGERS[gid].append(uid)
+    save_managers()
+
+    embed = discord.Embed(
+        title="✅ 管理員已添加 | Manager Added",
+        description=(
+            f"**用戶:** {member.mention} (`{uid}`)\n"
+            f"**伺服器:** {guild.name}\n"
+            f"**添加者:** {interaction.user.mention}\n"
+            f"**時間:** <t:{int(datetime.datetime.now(datetime.timezone.utc).timestamp())}:F>\n\n"
+            f"此用戶現在可以使用所有管理員功能：\n"
+            f"• 管理工單（領單、結單）\n"
+            f"• 設定金額、新增購買物品\n"
+            f"• 商品管理（新增/移除/庫存）\n"
+            f"• 同步/重整命令"
+        ),
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="admin-remove-manager", description="[超級管理員] 移除此伺服器的管理員")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    user_id="要移除管理員身份的用戶 ID"
+)
+async def admin_remove_manager(interaction: discord.Interaction, user_id: str):
+    """超級管理員專用：移除當前伺服器的動態管理員"""
+    if not is_super_admin(interaction.user.id):
+        await interaction.response.send_message("❌ 僅超級管理員可使用此命令。", ephemeral=True)
+        return
+
+    try:
+        uid = int(user_id)
+    except ValueError:
+        await interaction.response.send_message("❌ 請輸入有效的用戶 ID（純數字）。", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    gid = str(guild.id)
+
+    if gid not in GUILD_MANAGERS or uid not in GUILD_MANAGERS[gid]:
+        await interaction.response.send_message(
+            f"❌ 用戶 ID `{uid}` 不在此伺服器的管理員列表中。",
+            ephemeral=True
+        )
+        return
+
+    GUILD_MANAGERS[gid].remove(uid)
+    if not GUILD_MANAGERS[gid]:
+        del GUILD_MANAGERS[gid]
+    save_managers()
+
+    member = guild.get_member(uid)
+    name_text = f"{member.mention} (`{uid}`)" if member else f"`{uid}`"
+
+    embed = discord.Embed(
+        title="✅ 管理員已移除 | Manager Removed",
+        description=(
+            f"**用戶:** {name_text}\n"
+            f"**伺服器:** {guild.name}\n"
+            f"**移除者:** {interaction.user.mention}\n"
+            f"**時間:** <t:{int(datetime.datetime.now(datetime.timezone.utc).timestamp())}:F>"
+        ),
+        color=discord.Color.red()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="admin-list-managers", description="[超級管理員] 列出此伺服器的所有管理員")
+@app_commands.default_permissions(administrator=True)
+async def admin_list_managers(interaction: discord.Interaction):
+    """超級管理員專用：列出當前伺服器的所有動態管理員"""
+    if not is_super_admin(interaction.user.id):
+        await interaction.response.send_message("❌ 僅超級管理員可使用此命令。", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    gid = str(guild.id)
+
+    embed = discord.Embed(
+        title=f"👥 管理員列表 | {guild.name}",
+        color=discord.Color.blue()
+    )
+
+    # 超級管理員
+    super_text = ""
+    for sa_id in SUPER_ADMIN_IDS:
+        member = guild.get_member(sa_id)
+        if member:
+            super_text += f"• {member.mention} (`{sa_id}`) 👑\n"
+        else:
+            super_text += f"• `{sa_id}` 👑 (不在此伺服器)\n"
+    embed.add_field(name="👑 超級管理員", value=super_text or "無", inline=False)
+
+    # 固定身分組
+    admin_role = guild.get_role(ADMIN_ROLE_ID)
+    agent_role = guild.get_role(AGENT_ROLE_ID)
+    role_text = ""
+    if admin_role:
+        role_text += f"• {admin_role.mention} ({len(admin_role.members)} 人)\n"
+    if agent_role:
+        role_text += f"• {agent_role.mention} ({len(agent_role.members)} 人)\n"
+    embed.add_field(name="🛡️ 固定身分組", value=role_text or "無", inline=False)
+
+    # 動態管理員
+    if gid in GUILD_MANAGERS and GUILD_MANAGERS[gid]:
+        dynamic_text = ""
+        for mgr_id in GUILD_MANAGERS[gid]:
+            member = guild.get_member(mgr_id)
+            if member:
+                dynamic_text += f"• {member.mention} (`{mgr_id}`)\n"
+            else:
+                dynamic_text += f"• `{mgr_id}` (已離開伺服器)\n"
+        embed.add_field(name="📋 動態管理員（由超級管理員添加）", value=dynamic_text, inline=False)
+    else:
+        embed.add_field(name="📋 動態管理員（由超級管理員添加）", value="無", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ============================================================
@@ -1131,7 +1492,7 @@ async def admin_setup_inquiry(interaction: discord.Interaction, category_id: str
     stock="庫存數量（不填則不限庫存）"
 )
 async def add_product(interaction: discord.Interaction, name: str, emoji: str, description: str, details: str, stock: int = None):
-    if not is_admin(interaction.user) and not is_super_admin(interaction.user.id):
+    if not is_admin(interaction.user):
         await interaction.response.send_message("❌ 僅管理員可使用此命令。", ephemeral=True)
         return
 
@@ -1172,7 +1533,7 @@ async def add_product(interaction: discord.Interaction, name: str, emoji: str, d
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(name="要移除的商品名稱")
 async def remove_product(interaction: discord.Interaction, name: str):
-    if not is_admin(interaction.user) and not is_super_admin(interaction.user.id):
+    if not is_admin(interaction.user):
         await interaction.response.send_message("❌ 僅管理員可使用此命令。", ephemeral=True)
         return
 
@@ -1190,7 +1551,7 @@ async def remove_product(interaction: discord.Interaction, name: str):
 @bot.tree.command(name="list-products", description="列出所有商品 | List all products")
 @app_commands.default_permissions(administrator=True)
 async def list_products(interaction: discord.Interaction):
-    if not is_admin(interaction.user) and not is_super_admin(interaction.user.id):
+    if not is_admin(interaction.user):
         await interaction.response.send_message("❌ 僅管理員可使用此命令。", ephemeral=True)
         return
 
@@ -1214,7 +1575,7 @@ async def list_products(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(name="商品名稱", stock="庫存數量（-1 表示不限庫存）")
 async def set_stock(interaction: discord.Interaction, name: str, stock: int):
-    if not is_admin(interaction.user) and not is_super_admin(interaction.user.id):
+    if not is_admin(interaction.user):
         await interaction.response.send_message("❌ 僅管理員可使用此命令。", ephemeral=True)
         return
 
@@ -1266,9 +1627,10 @@ async def set_price_cmd(interaction: discord.Interaction, price: str):
 # ============================================================
 
 @bot.tree.command(name="restart", description="🔄 重啟機器人（僅管理員）")
+@app_commands.default_permissions(administrator=True)
 async def restart_bot(interaction: discord.Interaction):
     """重啟機器人進程"""
-    if not is_admin(interaction.user) and not is_super_admin(interaction.user.id):
+    if not is_admin(interaction.user):
         await interaction.response.send_message("❌ 僅管理員可使用此命令。", ephemeral=True)
         return
 
@@ -1282,9 +1644,10 @@ async def restart_bot(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="sync", description="🔄 同步斜線命令（僅管理員）")
+@app_commands.default_permissions(administrator=True)
 async def sync_commands(interaction: discord.Interaction):
     """重新同步所有斜線命令"""
-    if not is_admin(interaction.user) and not is_super_admin(interaction.user.id):
+    if not is_admin(interaction.user):
         await interaction.response.send_message("❌ 僅管理員可使用此命令。", ephemeral=True)
         return
 
@@ -1304,9 +1667,10 @@ async def sync_commands(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="refresh", description="🔄 重整機器人狀態（僅管理員）")
+@app_commands.default_permissions(administrator=True)
 async def refresh_bot(interaction: discord.Interaction):
     """重新載入持久化 View 和同步命令"""
-    if not is_admin(interaction.user) and not is_super_admin(interaction.user.id):
+    if not is_admin(interaction.user):
         await interaction.response.send_message("❌ 僅管理員可使用此命令。", ephemeral=True)
         return
 
@@ -1314,6 +1678,8 @@ async def refresh_bot(interaction: discord.Interaction):
     try:
         # 重新載入資料
         load_products()
+        load_managers()
+        load_guild_config()
 
         # 重新註冊持久化 View
         bot.add_view(ProductSelectView())
@@ -1332,6 +1698,8 @@ async def refresh_bot(interaction: discord.Interaction):
             f"✅ **機器人狀態已重整！**\n"
             f"• 持久化 View 已重新載入\n"
             f"• 商品資料已重新載入（{len(PRODUCTS)} 個商品）\n"
+            f"• 管理員資料已重新載入\n"
+            f"• 伺服器配置已重新載入\n"
             f"• 伺服器命令: {len(synced)} 個已同步\n"
             f"• 全域命令: {len(global_synced)} 個已同步\n"
             f"所有功能現在應該已經正常運作。",
@@ -1346,7 +1714,7 @@ async def refresh_bot(interaction: discord.Interaction):
 # ============================================================
 
 if __name__ == "__main__":
-    if TOKEN == "YOUR_BOT_TOKEN_HERE":
+    if not TOKEN or TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("❌ 請設置 DISCORD_TOKEN 環境變數！")
         print("在 .env 文件中設置: DISCORD_TOKEN=your_token_here")
         print("或設置環境變數: export DISCORD_TOKEN=your_token_here")
