@@ -8,6 +8,7 @@ import asyncio
 import io
 import json
 import re
+import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -43,6 +44,11 @@ INQUIRY_CATEGORY_ID = 1481598319066087454       # 意見單類別
 INQUIRY_PANEL_CHANNEL_ID = 1481598213281677424  # 意見單頻道（面板所在）
 
 # ============================================================
+# 評價頻道
+# ============================================================
+REVIEW_CHANNEL_ID = 1482093201652318380
+
+# ============================================================
 # 商品列表 - 從 products.json 載入
 # ============================================================
 PRODUCTS_FILE = "products.json"
@@ -57,8 +63,6 @@ GUILD_MANAGERS = {}
 
 # ============================================================
 # 伺服器配置 - 從 guild_config.json 載入
-# { "guild_id": { "product_log_channel": id, "inquiry_log_channel": id,
-#                  "product_category": id, "inquiry_category": id } }
 # ============================================================
 GUILD_CONFIG_FILE = "guild_config.json"
 GUILD_CONFIG = {}
@@ -95,7 +99,6 @@ def load_managers():
         if os.path.exists(MANAGERS_FILE):
             with open(MANAGERS_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-                # 確保 key 為 str，value 為 list[int]
                 GUILD_MANAGERS = {str(k): [int(uid) for uid in v] for k, v in raw.items()}
                 total = sum(len(v) for v in GUILD_MANAGERS.values())
                 print(f"👥 已載入 {total} 個動態管理員（跨 {len(GUILD_MANAGERS)} 個伺服器）")
@@ -182,13 +185,10 @@ def has_role(member: discord.Member, role_id: int) -> bool:
 
 def is_admin(member: discord.Member) -> bool:
     """檢查是否為管理員（管理員身分組 或 代理身分組 或 動態管理員 或 超級管理員）"""
-    # 超級管理員一定是管理員
     if is_super_admin(member.id):
         return True
-    # 固定身分組
     if has_role(member, ADMIN_ROLE_ID) or has_role(member, AGENT_ROLE_ID):
         return True
-    # 動態管理員（按伺服器）
     if member.guild:
         gid = str(member.guild.id)
         if gid in GUILD_MANAGERS and member.id in GUILD_MANAGERS[gid]:
@@ -215,6 +215,32 @@ def get_ticket_data(channel_id: int) -> dict:
             "inquiry_items": [],
         }
     return ticket_data[channel_id]
+
+
+def parse_satisfaction(value: str) -> int:
+    """解析滿意度輸入，支援數字 1-10 和中文 一~十，返回 0 表示無效"""
+    value = value.strip()
+    # 數字
+    try:
+        num = int(value)
+        if 1 <= num <= 10:
+            return num
+        return 0
+    except ValueError:
+        pass
+    # 中文
+    cn_map = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+    if value in cn_map:
+        return cn_map[value]
+    return 0
+
+
+def stars_display(rating: int) -> str:
+    """根據滿意度數字生成星星顯示（1-10 對應 0.5-5 顆星）"""
+    # 1-2 = ⭐, 3-4 = ⭐⭐, 5-6 = ⭐⭐⭐, 7-8 = ⭐⭐⭐⭐, 9-10 = ⭐⭐⭐⭐⭐
+    full_stars = (rating + 1) // 2
+    return "⭐" * full_stars
 
 
 # ============================================================
@@ -302,25 +328,32 @@ async def save_transcript(channel: discord.TextChannel, ticket_owner: discord.Me
             inline=False
         )
 
-    # 發送到工單頻道本身
-    file_bytes = chat_text.encode("utf-8")
-    txt_file = discord.File(
-        io.BytesIO(file_bytes),
-        filename=f"{channel.name}-log.txt"
-    )
-    await channel.send(embed=transcript_embed, file=txt_file)
-
-    # 如果有指定結單記錄頻道，也發送一份到那裡
+    # 只發送到結單記錄頻道（不在工單頻道內發送）
     if log_channel:
         try:
-            file_bytes2 = chat_text.encode("utf-8")
-            txt_file2 = discord.File(
-                io.BytesIO(file_bytes2),
+            file_bytes = chat_text.encode("utf-8")
+            txt_file = discord.File(
+                io.BytesIO(file_bytes),
                 filename=f"{channel.name}-log.txt"
             )
-            await log_channel.send(embed=transcript_embed, file=txt_file2)
+            await log_channel.send(embed=transcript_embed, file=txt_file)
         except Exception as e:
-            print(f"⚠️ 發送結單記錄到 {log_channel.id} 失敗: {e}")
+            print(f"⚠️ 發送結單記錄到記錄頻道失敗: {e}")
+            # 如果記錄頻道發送失敗，fallback 到工單頻道
+            file_bytes = chat_text.encode("utf-8")
+            txt_file = discord.File(
+                io.BytesIO(file_bytes),
+                filename=f"{channel.name}-log.txt"
+            )
+            await channel.send(embed=transcript_embed, file=txt_file)
+    else:
+        # 沒有記錄頻道時，發送到工單頻道
+        file_bytes = chat_text.encode("utf-8")
+        txt_file = discord.File(
+            io.BytesIO(file_bytes),
+            filename=f"{channel.name}-log.txt"
+        )
+        await channel.send(embed=transcript_embed, file=txt_file)
 
     return chat_text
 
@@ -429,6 +462,122 @@ class AddInquiryItemModal(discord.ui.Modal, title="🛒 新增購買物品 | Add
             item_embed.add_field(name="💰 目前總金額", value=data["price"], inline=False)
 
         await interaction.response.send_message(embed=item_embed)
+
+
+# ============================================================
+# 評價 Modal（用戶填寫滿意度和留言）
+# ============================================================
+
+class ReviewModal(discord.ui.Modal, title="📝 填寫評價 | Write Review"):
+    satisfaction = discord.ui.TextInput(
+        label="滿意度 (1-10 或 一~十)",
+        placeholder="請輸入 1-10 的數字或中文一~十",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=5
+    )
+    comment = discord.ui.TextInput(
+        label="留言 (最多100字)",
+        placeholder="請輸入您的評價留言...",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=100
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # 驗證滿意度
+        rating = parse_satisfaction(self.satisfaction.value)
+        if rating == 0:
+            await interaction.response.send_message(
+                "❌ **滿意度格式錯誤！**\n"
+                "請輸入 **1-10** 的數字，或中文 **一~十**。\n"
+                "例如：`8` 或 `八`",
+                ephemeral=True
+            )
+            return
+
+        # 生成星星
+        stars = stars_display(rating)
+
+        # 取得評價頻道
+        review_channel = interaction.guild.get_channel(REVIEW_CHANNEL_ID)
+        if not review_channel:
+            await interaction.response.send_message(
+                "❌ 找不到評價頻道，請聯繫管理員。",
+                ephemeral=True
+            )
+            return
+
+        # 使用 Webhook 模擬用戶發送評價
+        user = interaction.user
+        avatar_url = user.display_avatar.url if user.display_avatar else user.default_avatar.url
+        display_name = user.display_name
+
+        # 建立評價訊息內容
+        review_content = f"⭐ 星數：{stars}\n📝 留言：{self.comment.value}"
+
+        try:
+            # 取得或建立 Webhook
+            webhooks = await review_channel.webhooks()
+            webhook = None
+            for wh in webhooks:
+                if wh.name == "1ynticket-review":
+                    webhook = wh
+                    break
+            if not webhook:
+                webhook = await review_channel.create_webhook(name="1ynticket-review")
+
+            # 透過 Webhook 以用戶身份發送
+            sent_msg = await webhook.send(
+                content=review_content,
+                username=display_name,
+                avatar_url=avatar_url,
+                wait=True  # 等待訊息發送完成以取得 Message 物件
+            )
+
+            # 自動加上 ❤️ 反應
+            if sent_msg:
+                await sent_msg.add_reaction("❤️")
+
+        except Exception as e:
+            print(f"⚠️ Webhook 評價發送失敗: {e}")
+            # Fallback: 使用 Bot 發送 Embed
+            try:
+                review_embed = discord.Embed(
+                    description=f"⭐ 星數：{stars}\n📝 留言：{self.comment.value}",
+                    color=discord.Color.gold()
+                )
+                review_embed.set_author(name=display_name, icon_url=avatar_url)
+                sent_msg = await review_channel.send(embed=review_embed)
+                await sent_msg.add_reaction("❤️")
+            except Exception as e2:
+                print(f"⚠️ Fallback 評價發送也失敗: {e2}")
+
+        # 回覆用戶
+        await interaction.response.send_message(
+            "✅ **感謝您的評價！** 您的反饋已成功發送。",
+            ephemeral=True
+        )
+
+
+# ============================================================
+# 評價按鈕 View（結單後顯示）
+# ============================================================
+
+class ReviewButtonView(discord.ui.View):
+    """填寫評價按鈕 - persistent view"""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="📝 填寫評價",
+        style=discord.ButtonStyle.success,
+        emoji="📝",
+        custom_id="review_ticket_btn"
+    )
+    async def write_review(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = ReviewModal()
+        await interaction.response.send_modal(modal)
 
 
 # ============================================================
@@ -614,14 +763,17 @@ class ConfirmCloseView(discord.ui.View):
 
         # 獲取工單擁有者
         ticket_owner = interaction.user
-        if channel.topic:
+        owner_id = data.get("owner_id")
+        if not owner_id and channel.topic:
             try:
                 owner_id = int(channel.topic.split("owner:")[1].split("|")[0].strip())
-                member = guild.get_member(owner_id)
-                if member:
-                    ticket_owner = member
             except (ValueError, IndexError):
                 pass
+
+        if owner_id:
+            member = guild.get_member(owner_id)
+            if member:
+                ticket_owner = member
 
         # 確定結單記錄頻道
         log_channel = None
@@ -636,17 +788,50 @@ class ConfirmCloseView(discord.ui.View):
             elif not is_inquiry and gconfig.get("product_log_channel"):
                 log_channel = guild.get_channel(gconfig["product_log_channel"])
 
-        # 保存聊天記錄
+        # 保存聊天記錄（發送到結單記錄頻道）
         await save_transcript(channel, ticket_owner, ticket_type, ticket_info,
                               price=price, claimed_by_name=claimed_by_name,
                               closer=interaction.user, log_channel=log_channel)
 
-        # 清理內存
+        # ============================================================
+        # 結單後：關閉用戶發言權限 + 發送評價邀請
+        # ============================================================
+
+        # 關閉開單者的發言權限（只能看不能打字）
+        if owner_id:
+            owner_member = guild.get_member(owner_id)
+            if owner_member:
+                try:
+                    await channel.set_permissions(
+                        owner_member,
+                        read_messages=True,
+                        send_messages=False,
+                        attach_files=False,
+                        embed_links=False
+                    )
+                except Exception as e:
+                    print(f"⚠️ 關閉用戶發言權限失敗: {e}")
+
+        # 發送評價邀請訊息 + 按鈕
+        review_embed = discord.Embed(
+            title="🎉 感謝您的支持！",
+            description=(
+                "感謝您對我們連點器的支持，如果方便請按下【📝 填寫評價】按鈕，\n"
+                "讓大家知道你對我們的反饋！"
+            ),
+            color=discord.Color.gold()
+        )
+        review_embed.set_footer(text="1ynz. | 台灣最強連點器")
+
+        review_view = ReviewButtonView()
+        await channel.send(embed=review_embed, view=review_view)
+
+        # 不再自動刪除頻道，讓用戶有時間填寫評價
+        # 管理員可以手動刪除頻道，或之後可以加入定時刪除
+
+        # 清理內存中的工單資料（但保留頻道）
         if channel.id in ticket_data:
             del ticket_data[channel.id]
-
-        await asyncio.sleep(3)
-        await channel.delete(reason=f"工單結單 by {interaction.user}")
 
     @discord.ui.button(label="❌ 取消 | Cancel", style=discord.ButtonStyle.secondary, custom_id="close_ticket_cancel")
     async def cancel_close(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -802,7 +987,8 @@ class ProductSelectMenu(discord.ui.Select):
             ),
             guild.me: discord.PermissionOverwrite(
                 read_messages=True, send_messages=True,
-                manage_channels=True, manage_messages=True
+                manage_channels=True, manage_messages=True,
+                manage_permissions=True
             )
         }
         if admin_role:
@@ -940,7 +1126,8 @@ class InquiryTicketView(discord.ui.View):
             ),
             guild.me: discord.PermissionOverwrite(
                 read_messages=True, send_messages=True,
-                manage_channels=True, manage_messages=True
+                manage_channels=True, manage_messages=True,
+                manage_permissions=True
             )
         }
         if admin_role:
@@ -1032,6 +1219,7 @@ async def on_ready():
     bot.add_view(ClaimTicketView())
     bot.add_view(AdminTicketView())
     bot.add_view(InquiryAdminView())
+    bot.add_view(ReviewButtonView())
 
     # 同步斜線命令
     try:
@@ -1056,6 +1244,12 @@ async def on_interaction(interaction: discord.Interaction):
         return
 
     custom_id = interaction.data.get("custom_id", "")
+
+    # 評價按鈕備用處理器
+    if custom_id == "review_ticket_btn":
+        modal = ReviewModal()
+        await interaction.response.send_modal(modal)
+        return
 
     # 洽群開單按鈕備用處理器
     if custom_id == "inquiry_add_item_btn":
@@ -1336,7 +1530,6 @@ async def admin_add_manager(interaction: discord.Interaction, user_id: str):
     # 檢查用戶是否存在於伺服器
     member = guild.get_member(uid)
     if not member:
-        # 嘗試 fetch
         try:
             member = await guild.fetch_member(uid)
         except discord.NotFound:
@@ -1512,8 +1705,8 @@ async def add_product(interaction: discord.Interaction, name: str, emoji: str, d
         "emoji": "",
         "display_emoji": emoji,
         "description": description,
-        "prices": prices,
         "details": details,
+        "prices": prices,
         "stock": stock
     }
     PRODUCTS.append(new_product)
@@ -1689,6 +1882,7 @@ async def refresh_bot(interaction: discord.Interaction):
         bot.add_view(ClaimTicketView())
         bot.add_view(AdminTicketView())
         bot.add_view(InquiryAdminView())
+        bot.add_view(ReviewButtonView())
 
         # 同步命令
         synced = await bot.tree.sync(guild=interaction.guild)
