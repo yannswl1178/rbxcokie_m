@@ -445,7 +445,7 @@ class CloseTicketView(discord.ui.View):
 class ConfirmCloseView(discord.ui.View):
     """結單確認 - 第二次確認"""
     def __init__(self):
-        super().__init__(timeout=60)
+        super().__init__(timeout=None)
 
     @discord.ui.button(label="✅ 確認結單 | Confirm Close", style=discord.ButtonStyle.danger, custom_id="close_ticket_confirm")
     async def confirm_close(self, interaction: discord.Interaction, button: discord.ui.Button):
