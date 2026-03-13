@@ -559,6 +559,24 @@ class ReviewModal(discord.ui.Modal, title="📝 填寫評價 | Write Review"):
             ephemeral=True
         )
 
+        # 在工單頻道發送5分鐘後刪除的提示
+        ticket_channel = interaction.channel
+        if ticket_channel:
+            try:
+                delete_embed = discord.Embed(
+                    title="⏳ 工單即將關閉",
+                    description="此工單將於 **5 分鐘**後刪除，有任何問題請聯絡管理員。",
+                    color=discord.Color.red()
+                )
+                delete_embed.set_footer(text="1ynz. | 台灣最強連點器")
+                await ticket_channel.send(embed=delete_embed)
+
+                # 5分鐘後自動刪除頻道
+                await asyncio.sleep(300)
+                await ticket_channel.delete(reason="評價已完成，自動刪除工單")
+            except Exception as e:
+                print(f"⚠️ 自動刪除工單頻道失敗: {e}")
+
 
 # ============================================================
 # 評價按鈕 View（結單後顯示）
@@ -570,7 +588,7 @@ class ReviewButtonView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="📝 填寫評價",
+        label="填寫評價",
         style=discord.ButtonStyle.success,
         emoji="📝",
         custom_id="review_ticket_btn"
